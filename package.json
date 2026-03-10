@@ -1,17 +1,26 @@
 {
   "name": "pg-guardian",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "CLI that analyzes PostgreSQL query performance via pg_stat_statements and EXPLAIN plans",
   "main": "dist/index.js",
   "bin": {
     "pg-guardian": "./dist/index.js"
   },
+  "files": [
+    "dist/**/*"
+  ],
   "scripts": {
-    "build": "tsc",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc",
+    "prepublishOnly": "npm run build",
     "analyze": "ts-node src/index.ts"
   },
-  "keywords": ["postgresql", "performance", "query-analyzer", "pg_stat_statements"],
+  "keywords": ["postgresql", "performance", "query-analyzer", "pg_stat_statements", "explain", "slow-queries"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/9-labs/pg-guardian.git"
+  },
   "dependencies": {
     "chalk": "^4.1.2",
     "commander": "^12.1.0",
