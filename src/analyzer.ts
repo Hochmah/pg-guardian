@@ -8,6 +8,7 @@ export interface Diagnostic {
   detail: string;
   suggestion: string;
   severity: 'warning' | 'critical';
+  confidence: 'high' | 'medium' | 'low';
 }
 
 // ---------------------------------------------------------------------------
@@ -24,13 +25,47 @@ function walkNodes(node: ExplainNode, callback: (n: ExplainNode) => void): void 
 }
 
 // ---------------------------------------------------------------------------
-// Helper: extract column name from a Filter expression
+// Helper: extract column names from a Filter expression
 // ---------------------------------------------------------------------------
 
-function extractFilterColumn(filter: string): string {
-  // Typical filter: "((status)::text = 'active'::text)" or "(age > 30)"
-  const match = filter.match(/\((\w+)\)/);
-  return match ? match[1] : filter.replace(/[()]/g, '').split(/\s/)[0];
+function extractFilterColumns(filter: string): string[] {
+  // Remove outer parens and type casts like ::text
+  const cleaned = filter.replace(/::\w+/g, '');
+  // Split on AND / OR to find multiple conditions
+  const parts = cleaned.split(/\bAND\b|\bOR\b/i);
+  const columns: string[] = [];
+  for (const part of parts) {
+    // Match patterns like (column_name), table.column, or bare column_name before operator
+    const match = part.match(/\((\w+)\)/) || part.match(/(\w+)\.(\w+)/) || part.match(/(\w+)\s*[=<>!]/);
+    if (match) {
+      const col = match[2] || match[1];
+      if (col && !columns.includes(col)) {
+        columns.push(col);
+      }
+    }
+  }
+  return columns.length > 0 ? columns : ['<unknown column>'];
+}
+
+// ---------------------------------------------------------------------------
+// Helper: check if a column is already indexed
+// ---------------------------------------------------------------------------
+
+function isColumnIndexed(
+  column: string,
+  indexDefs: string[]
+): boolean {
+  const colLower = column.toLowerCase();
+  return indexDefs.some((def) => {
+    const lower = def.toLowerCase();
+    // Match column in index definition: (column) or (column, ...) or (..., column)
+    return (
+      lower.includes(`(${colLower})`) ||
+      lower.includes(`(${colLower},`) ||
+      lower.includes(`, ${colLower})`) ||
+      lower.includes(`, ${colLower},`)
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -44,9 +79,8 @@ function extractJoinColumn(node: ExplainNode): string {
     node['Merge Cond'] ||
     node['Index Cond'];
   if (!cond) return '<join column>';
-  // e.g. "(a.id = b.user_id)" → try to extract the right-hand side
   const match = String(cond).match(/(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)/);
-  if (match) return `${match[3]}.${match[4]}`;
+  if (match) return match[4];
   return String(cond).replace(/[()]/g, '').trim();
 }
 
@@ -68,7 +102,9 @@ function findInnerRelation(node: ExplainNode): string {
 
 export function checkSeqScanLarge(
   plan: ExplainNode,
-  query: string
+  query: string,
+  indexesByTable: Map<string, string[]>,
+  estimated: boolean
 ): Diagnostic[] {
   const diagnostics: Diagnostic[] = [];
 
@@ -79,14 +115,47 @@ export function checkSeqScanLarge(
       node['Filter']
     ) {
       const table = node['Relation Name'] || node['Alias'] || '<unknown>';
-      const col = extractFilterColumn(node['Filter']);
+      const columns = extractFilterColumns(node['Filter']);
+      const tableIndexes = indexesByTable.get(table) || [];
+      const isMultiColumn = columns.length > 1;
+
+      // Check if all filter columns are already indexed
+      const allIndexed = columns.every((col) =>
+        col !== '<unknown column>' && isColumnIndexed(col, tableIndexes)
+      );
+      if (allIndexed) return;
+
+      const unindexedCols = columns.filter(
+        (col) => col !== '<unknown column>' && !isColumnIndexed(col, tableIndexes)
+      );
+
+      let confidence: 'high' | 'medium' | 'low';
+      let suggestion: string;
+      let detailSuffix = '';
+
+      if (isMultiColumn) {
+        confidence = 'low';
+        detailSuffix = ' Complex filter detected — manual review recommended.';
+        suggestion = `-- Consider a composite index:\nCREATE INDEX idx_${table}_composite ON ${table} (${unindexedCols.join(', ')});`;
+      } else {
+        confidence = 'high';
+        const col = unindexedCols[0] || columns[0];
+        suggestion = `CREATE INDEX idx_${table}_${col} ON ${table} (${col});`;
+      }
+
+      if (estimated) {
+        detailSuffix += ' (Plan based on estimates only — parameterized query)';
+        if (confidence === 'high') confidence = 'medium';
+      }
+
       diagnostics.push({
         rule: 'SEQ_SCAN_LARGE',
         table,
         query,
-        detail: `Sequential scan on "${table}" with ~${node['Plan Rows'].toLocaleString()} estimated rows and a filter on "${col}". An index could eliminate the full table scan.`,
-        suggestion: `CREATE INDEX idx_${table}_${col} ON ${table} (${col});`,
+        detail: `Sequential scan on "${table}" with ~${node['Plan Rows'].toLocaleString()} estimated rows and filter on ${columns.map((c) => `"${c}"`).join(', ')}.${detailSuffix}`,
+        suggestion,
         severity: 'warning',
+        confidence,
       });
     }
   });
@@ -95,7 +164,7 @@ export function checkSeqScanLarge(
 }
 
 // ---------------------------------------------------------------------------
-// Rule 2: BAD_CARDINALITY
+// Rule 2: BAD_CARDINALITY (bidirectional)
 // ---------------------------------------------------------------------------
 
 export function checkBadCardinality(
@@ -106,20 +175,41 @@ export function checkBadCardinality(
 
   walkNodes(plan, (node) => {
     const actualRows = node['Actual Rows'];
+    const actualLoops = node['Actual Loops'] ?? 1;
     const planRows = node['Plan Rows'];
-    if (
-      actualRows !== undefined &&
-      planRows > 0 &&
-      actualRows > 10 * planRows
-    ) {
+
+    if (actualRows === undefined || planRows <= 0) return;
+
+    const totalActual = actualRows * actualLoops;
+    const totalPlanned = planRows; // Plan Rows is already per-loop in PG
+
+    // Underestimate: actual >> planned
+    if (totalActual > 10 * totalPlanned) {
       const table = node['Relation Name'] || node['Alias'] || '<unknown>';
+      const ratio = Math.round(totalActual / totalPlanned);
       diagnostics.push({
         rule: 'BAD_CARDINALITY',
         table,
         query,
-        detail: `Planner estimated ${planRows.toLocaleString()} rows but got ${actualRows.toLocaleString()} actual rows (${Math.round(actualRows / planRows)}x off). Table statistics are likely stale.`,
+        detail: `Planner underestimated: expected ${totalPlanned.toLocaleString()} rows but got ${totalActual.toLocaleString()} actual rows (${ratio}x off). Table statistics are likely stale.`,
         suggestion: `ANALYZE ${table};`,
         severity: 'warning',
+        confidence: 'high',
+      });
+    }
+
+    // Overestimate: planned >> actual
+    if (totalActual > 0 && totalPlanned > 10 * totalActual) {
+      const table = node['Relation Name'] || node['Alias'] || '<unknown>';
+      const ratio = Math.round(totalPlanned / totalActual);
+      diagnostics.push({
+        rule: 'BAD_CARDINALITY',
+        table,
+        query,
+        detail: `Planner overestimated: expected ${totalPlanned.toLocaleString()} rows but got ${totalActual.toLocaleString()} actual rows (${ratio}x off). This can cause suboptimal join strategies.`,
+        suggestion: `ANALYZE ${table};`,
+        severity: 'warning',
+        confidence: 'high',
       });
     }
   });
@@ -133,7 +223,8 @@ export function checkBadCardinality(
 
 export function checkNestedLoopExplosion(
   plan: ExplainNode,
-  query: string
+  query: string,
+  indexesByTable: Map<string, string[]>
 ): Diagnostic[] {
   const diagnostics: Diagnostic[] = [];
 
@@ -144,13 +235,21 @@ export function checkNestedLoopExplosion(
       if (loops * rows > 50_000) {
         const innerTable = findInnerRelation(node);
         const joinCol = extractJoinColumn(node);
+        const tableIndexes = indexesByTable.get(innerTable) || [];
+
+        // Skip if join column is already indexed
+        if (joinCol !== '<join column>' && isColumnIndexed(joinCol, tableIndexes)) {
+          return;
+        }
+
         diagnostics.push({
           rule: 'NESTED_LOOP_EXPLOSION',
           table: innerTable,
           query,
           detail: `Nested Loop produced ${(loops * rows).toLocaleString()} rows (${loops.toLocaleString()} loops x ${rows.toLocaleString()} rows). Consider adding an index on the inner relation to reduce loop cost.`,
-          suggestion: `CREATE INDEX idx_${innerTable}_join ON ${innerTable} (${joinCol});`,
+          suggestion: `CREATE INDEX idx_${innerTable}_${joinCol} ON ${innerTable} (${joinCol});`,
           severity: 'warning',
+          confidence: joinCol === '<join column>' ? 'low' : 'medium',
         });
       }
     }
@@ -160,12 +259,13 @@ export function checkNestedLoopExplosion(
 }
 
 // ---------------------------------------------------------------------------
-// Rule 4: DISK_SORT
+// Rule 4: DISK_SORT (cautious recommendation)
 // ---------------------------------------------------------------------------
 
 export function checkDiskSort(
   plan: ExplainNode,
-  query: string
+  query: string,
+  estimated: boolean
 ): Diagnostic[] {
   const diagnostics: Diagnostic[] = [];
 
@@ -176,13 +276,23 @@ export function checkDiskSort(
       node['Sort Method'].toLowerCase().includes('external merge')
     ) {
       const table = node['Relation Name'] || node['Alias'] || '<unknown>';
+      let detail = 'Sort spilled to disk using external merge. work_mem may be too small for this operation.';
+      if (estimated) {
+        detail += ' (Plan based on estimates only — parameterized query)';
+      }
+
       diagnostics.push({
         rule: 'DISK_SORT',
         table,
         query,
-        detail: `Sort spilled to disk using external merge. This means work_mem is too small to sort the data in-memory.`,
-        suggestion: `SET work_mem = '256MB'; -- or increase in postgresql.conf`,
+        detail,
+        suggestion:
+          'SET work_mem = \'64MB\'; -- test with this query first\n' +
+          '   -- WARNING: work_mem is per-operation, not per-query.\n' +
+          '   -- Increasing globally affects all concurrent sorts.\n' +
+          '   -- Test per-session before changing postgresql.conf.',
         severity: 'warning',
+        confidence: 'medium',
       });
     }
   });
@@ -201,8 +311,9 @@ export function checkSlowQuery(sq: SlowQuery): Diagnostic | null {
       table: '-',
       query: sq.query,
       detail: `Query averages ${Math.round(sq.meanTime)}ms over ${sq.calls.toLocaleString()} calls (total: ${Math.round(sq.totalTime / 1000)}s). High frequency + high latency = critical impact.`,
-      suggestion: `Review this query for optimization opportunities. Consider caching, query rewriting, or adding indexes.`,
+      suggestion: 'Review this query for optimization opportunities. Consider caching, query rewriting, or adding indexes.',
       severity: 'critical',
+      confidence: 'high',
     };
   }
   return null;
@@ -213,11 +324,16 @@ export function checkSlowQuery(sq: SlowQuery): Diagnostic | null {
 // ---------------------------------------------------------------------------
 
 export function analyzeAll(
-  plans: Array<{ slowQuery: SlowQuery; plan: ExplainNode | null }>,
+  plans: Array<{
+    slowQuery: SlowQuery;
+    plan: ExplainNode | null;
+    estimated: boolean;
+  }>,
+  indexesByTable: Map<string, string[]>
 ): Diagnostic[] {
   const diagnostics: Diagnostic[] = [];
 
-  for (const { slowQuery, plan } of plans) {
+  for (const { slowQuery, plan, estimated } of plans) {
     // Rule 5 applies to the query metadata, not the plan
     const slowDiag = checkSlowQuery(slowQuery);
     if (slowDiag) diagnostics.push(slowDiag);
@@ -225,10 +341,21 @@ export function analyzeAll(
     // Rules 1-4 require a valid EXPLAIN plan
     if (!plan) continue;
 
-    diagnostics.push(...checkSeqScanLarge(plan, slowQuery.query));
-    diagnostics.push(...checkBadCardinality(plan, slowQuery.query));
-    diagnostics.push(...checkNestedLoopExplosion(plan, slowQuery.query));
-    diagnostics.push(...checkDiskSort(plan, slowQuery.query));
+    // SEQ_SCAN_LARGE works with Plan Rows (ok for estimated)
+    diagnostics.push(...checkSeqScanLarge(plan, slowQuery.query, indexesByTable, estimated));
+
+    // BAD_CARDINALITY needs Actual Rows — skip for estimated plans
+    if (!estimated) {
+      diagnostics.push(...checkBadCardinality(plan, slowQuery.query));
+    }
+
+    // NESTED_LOOP_EXPLOSION needs Actual Loops — skip for estimated plans
+    if (!estimated) {
+      diagnostics.push(...checkNestedLoopExplosion(plan, slowQuery.query, indexesByTable));
+    }
+
+    // DISK_SORT uses Sort Method (ok for estimated, though rare without ANALYZE)
+    diagnostics.push(...checkDiskSort(plan, slowQuery.query, estimated));
   }
 
   return diagnostics;

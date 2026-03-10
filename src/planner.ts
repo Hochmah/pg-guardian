@@ -20,7 +20,20 @@ export interface ExplainNode {
   [key: string]: unknown;
 }
 
-interface ExplainResult {
+export interface ExplainSuccess {
+  ok: true;
+  plan: ExplainNode;
+  estimated: boolean;
+}
+
+export interface ExplainFailure {
+  ok: false;
+  reason: string;
+}
+
+export type ExplainOutcome = ExplainSuccess | ExplainFailure;
+
+interface ExplainPlanResult {
   Plan: ExplainNode;
   'Planning Time'?: number;
   'Execution Time'?: number;
@@ -46,7 +59,7 @@ function replaceParams(query: string): string {
 export async function explainQuery(
   client: Client,
   query: string
-): Promise<ExplainNode | null> {
+): Promise<ExplainOutcome> {
   try {
     const parameterized = hasParameters(query);
     const dml = isDml(query);
@@ -75,11 +88,10 @@ export async function explainQuery(
       result = await client.query(explainSql);
     }
 
-    const plan = result.rows[0]['QUERY PLAN'] as ExplainResult[];
-    return plan[0].Plan;
-  } catch {
-    // Silently skip queries that can't be explained
-    // (e.g., utility commands, SET statements, etc.)
-    return null;
+    const plan = result.rows[0]['QUERY PLAN'] as ExplainPlanResult[];
+    return { ok: true, plan: plan[0].Plan, estimated: parameterized };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: message };
   }
 }

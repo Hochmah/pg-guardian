@@ -55,3 +55,14 @@ export async function collectSlowQueries(client: Client): Promise<SlowQuery[]> {
     totalTime: Number(row.total_time),
   }));
 }
+
+export async function fetchTableIndexes(
+  client: Client,
+  tableName: string
+): Promise<string[]> {
+  const result = await client.query(
+    `SELECT indexdef FROM pg_indexes WHERE tablename = $1`,
+    [tableName]
+  );
+  return result.rows.map((row) => String(row.indexdef));
+}
